@@ -1,20 +1,77 @@
 #ifndef QUERY5_HPP
 #define QUERY5_HPP
 
+#include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
-#include <map>
 
-// Function to parse command line arguments
-bool parseArgs(int argc, char* argv[], std::string& r_name, std::string& start_date, std::string& end_date, int& num_threads, std::string& table_path, std::string& result_path);
+// Per-table row structs containing only the columns Query 5 needs.
+// Reading just the needed fields keeps memory usage feasible at SF2
+// (lineitem has ~12M rows; storing every column as a map<string,string>
+// would consume tens of GB and dominate runtime).
 
-// Function to read TPCH data from the specified paths
-bool readTPCHData(const std::string& table_path, std::vector<std::map<std::string, std::string>>& customer_data, std::vector<std::map<std::string, std::string>>& orders_data, std::vector<std::map<std::string, std::string>>& lineitem_data, std::vector<std::map<std::string, std::string>>& supplier_data, std::vector<std::map<std::string, std::string>>& nation_data, std::vector<std::map<std::string, std::string>>& region_data);
+struct Region {
+    int32_t key;
+    std::string name;
+};
 
-// Function to execute TPCH Query 5 using multithreading
-bool executeQuery5(const std::string& r_name, const std::string& start_date, const std::string& end_date, int num_threads, const std::vector<std::map<std::string, std::string>>& customer_data, const std::vector<std::map<std::string, std::string>>& orders_data, const std::vector<std::map<std::string, std::string>>& lineitem_data, const std::vector<std::map<std::string, std::string>>& supplier_data, const std::vector<std::map<std::string, std::string>>& nation_data, const std::vector<std::map<std::string, std::string>>& region_data, std::map<std::string, double>& results);
+struct Nation {
+    int32_t key;
+    std::string name;
+    int32_t region_key;
+};
 
-// Function to output results to the specified path
-bool outputResults(const std::string& result_path, const std::map<std::string, double>& results);
+struct Supplier {
+    int32_t key;
+    int32_t nation_key;
+};
 
-#endif // QUERY5_HPP 
+struct Customer {
+    int32_t key;
+    int32_t nation_key;
+};
+
+struct Order {
+    int32_t key;
+    int32_t cust_key;
+    std::string orderdate;
+};
+
+struct LineItem {
+    int32_t order_key;
+    int32_t supp_key;
+    double extendedprice;
+    double discount;
+};
+
+struct TPCHData {
+    std::vector<Region> region;
+    std::vector<Nation> nation;
+    std::vector<Supplier> supplier;
+    std::vector<Customer> customer;
+    std::vector<Order> orders;
+    std::vector<LineItem> lineitem;
+};
+
+bool parseArgs(int argc, char* argv[],
+               std::string& r_name,
+               std::string& start_date,
+               std::string& end_date,
+               int& num_threads,
+               std::string& table_path,
+               std::string& result_path);
+
+bool readTPCHData(const std::string& table_path, TPCHData& data);
+
+bool executeQuery5(const std::string& r_name,
+                   const std::string& start_date,
+                   const std::string& end_date,
+                   int num_threads,
+                   const TPCHData& data,
+                   std::map<std::string, double>& results);
+
+bool outputResults(const std::string& result_path,
+                   const std::map<std::string, double>& results);
+
+#endif // QUERY5_HPP
