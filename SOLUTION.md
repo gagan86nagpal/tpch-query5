@@ -107,11 +107,30 @@ in microbench.
 
 ## 5. Multithreading strategy
 
-Only one piece of work scales with data size: the ~12M-row lineitem scan.
-Everything else (region, nation, supplier, customer, orders) is small and
-runs once before the parallel section starts.
+Two stages scale with data size: the 3M-row **orders filter** and the
+12M-row **lineitem scan**. Both are parallelized; the small filters
+(region, nation, supplier, customer) run sequentially because they're
+already < 5 ms.
 
-Approach:
+### Stage 5 — orders filter (parallel)
+
+Each worker is given a contiguous slice of the orders vector and produces
+a local `vector<pair<order_key, cust_key>>` of the rows that survive both
+the date filter and the customer-eligibility check. After all workers
+join, the main thread merges those local vectors into a single
+`unordered_map`. The map is built once, used for the rest of the query.
+
+Why a `vector<pair>` instead of a per-thread `unordered_map`?
+
+- Each worker only ever appends; there are no duplicate keys to dedupe
+  inside a single thread (each order key is unique in the input).
+- `vector::emplace_back` on contiguous memory is much cheaper than
+  `unordered_map::emplace` with hashing + bucket allocation.
+- The single hash map is built once at merge time, sized to the exact
+  total count, so the overall hashing work is the same — just deferred
+  out of the hot parallel loop.
+
+### Stage 6 — lineitem scan (parallel)
 
 - Slice the `lineitem` vector into `num_threads` equal contiguous ranges.
 - Each thread accumulates into its **own** `unordered_map<int32_t, double>`
@@ -122,7 +141,7 @@ Approach:
   maps element-wise, then translate `nation_key → nation_name` from the
   `nation_in_region` map.
 
-What we deliberately did **not** do:
+### What we deliberately did **not** do
 
 - **No shared accumulator + mutex** — would serialize the hot loop and
   destroy the speedup.
@@ -132,6 +151,11 @@ What we deliberately did **not** do:
   row does the same hash probes), so static partition is optimal.
 - **No SIMD** — the bottleneck is hash lookups and unpredictable branches,
   not arithmetic. Vectorization wouldn't help.
+- **No special-cased single-threaded path.** At `--threads 1` we still
+  spawn one std::thread for both parallel stages. This costs ~45 ms of
+  overhead at N=1 (vector allocations, thread spawn, merge step), but
+  keeps the comparison apples-to-apples: every reported speedup uses the
+  same code path at different thread counts.
 
 ## 6. Reading the data
 
@@ -154,32 +178,50 @@ Total load time at SF2 is ~3.4 s, dominated by reading 1.5 GB of
 
 ## 7. Measured speedup and why it isn't linear
 
-Reference numbers (median of 3 runs, `g++ 12.2 -O3`, SF2, ASIA, 1994):
+Reference numbers (median of 4 runs, `g++ 12.2 -O3`, SF2, ASIA, 1994):
+
+| Threads | Query exec | Speedup |
+|--------:|-----------:|--------:|
+|       1 |     207 ms |   1.00× |
+|       2 |     132 ms |   1.57× |
+|       4 |      89 ms |   2.33× |
+|       8 |      63 ms |   3.29× |
+
+Of the 207 ms single-thread query, roughly:
+
+- ~25 ms sequential setup (region, nation, supplier, customer filters).
+- ~80 ms parallelizable orders filter (build + merge).
+- ~95 ms parallelizable lineitem scan.
+- ~7 ms thread spawn / join / final reduce overhead.
+
+So the theoretical max speedup is `207 / (25 + (80+95)/N + 7)`:
+
+- N=4 → 207 / (25 + 43.75 + 7) = ~2.74×  (we hit 2.33×, ~85% of theoretical)
+- N=8 → 207 / (25 + 21.9 + 7) = ~3.85×   (we hit 3.29×, ~86% of theoretical)
+
+The remaining gap is the merge step in the orders filter (single-threaded
+linear pass over the partial vectors), L3 cache contention, and minor
+dispatch overhead at higher thread counts.
+
+### Earlier design (single-stage parallelism)
+
+An earlier version parallelized only the lineitem scan and left the orders
+filter serial. Numbers were:
 
 | Threads | Query exec | Speedup |
 |--------:|-----------:|--------:|
 |       1 |     162 ms |   1.00× |
-|       2 |     128 ms |   1.27× |
 |       4 |     108 ms |   1.50× |
-|       8 |      97 ms |   1.67× |
 
-The ceiling is Amdahl's law. Of the 162 ms single-thread query:
+That version had a faster baseline (no merge overhead at N=1) but a much
+lower speedup ceiling: the 70 ms of serial filter work pinned theoretical
+max at ~2.31× even at infinite threads. Trading 45 ms of N=1 overhead for
+a parallel orders filter cuts the serial portion from 70 ms to 25 ms and
+unlocks the 2-3× regime.
 
-- ~70 ms is sequential setup (build five hash maps).
-- ~92 ms is the parallelizable lineitem scan.
-
-So the theoretical max speedup is `162 / (70 + 92/N)`:
-
-- N=4 → 162 / (70 + 23) = 1.74×  (we hit 1.50×, ~86% of theoretical)
-- N=8 → 162 / (70 + 11.5) = 1.99×  (we hit 1.67×, ~84% of theoretical)
-
-The remaining gap is thread spawn/join overhead (~5 ms each at this scale)
-and L3 cache contention.
-
-If the goal were to push past ~2×, the next move would be to also
-parallelize the orders-table filter (the largest sequential component).
-Held off because the README only asks for 1- and 4-thread numbers and the
-extra complexity isn't justified.
+To push beyond 3.5×, you would need to either parallelize the file load
+(currently 3.4 s, single-threaded `getline`) or move to a streaming
+pipeline that overlaps load and query. Neither is asked for here.
 
 ## 8. Things checked but not implemented
 
@@ -187,10 +229,18 @@ extra complexity isn't justified.
   a Linux-specific code path. Skipped to keep the build portable.
 - **Compact orders representation.** Storing `o_orderdate` as `int32_t`
   packed `YYYYMMDD` would save ~24 MB and ~5 ms on the orders filter.
-  Not measurable end-to-end.
+  Not measurable end-to-end now that the orders filter is parallel.
 - **Bloom filter in front of orders_cust.** Would cut the first hash probe
   for the 96% of lineitem rows that don't match. Tested; small (~3-5 ms)
   win at SF2, doesn't justify the extra code. Would matter more at SF10+.
+- **Special-cased N=1 path** that skips the parallel-ready orders filter.
+  Would push the 1T number from 207 ms back down to ~162 ms, but turns
+  the 1T-vs-4T comparison into apples-to-oranges (different code paths).
+  Kept the unified design.
+- **Parallel customer filter.** Only ~5 ms of serial work; thread spawn
+  overhead would eat the gain.
+- **Parallel data load.** README scopes "runtime" to query execution, not
+  load. Skipped to match the spec.
 
 ## 9. Correctness verification
 

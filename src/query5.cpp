@@ -251,16 +251,48 @@ bool executeQuery5(const std::string& r_name,
     }
 
     // 5. Orders in date range whose customer is eligible: order_key -> cust_key.
-    //    ISO yyyy-mm-dd compares correctly as a string lexicographically.
-    std::unordered_map<int32_t, int32_t> orders_cust;
-    orders_cust.reserve(data.orders.size() / 4 + 1);
-    for (const auto& o : data.orders) {
-        if (o.orderdate >= start_date && o.orderdate < end_date) {
-            auto it = customer_nation.find(o.cust_key);
-            if (it != customer_nation.end()) {
-                orders_cust.emplace(o.key, o.cust_key);
+    //    Parallelized: each worker emits a local vector of (key, cust_key)
+    //    pairs, then we merge them into a single hash map. ISO yyyy-mm-dd
+    //    compares correctly as a string lexicographically.
+    const size_t no = data.orders.size();
+    std::vector<std::vector<std::pair<int32_t, int32_t>>> orders_partial(num_threads);
+
+    auto orders_worker = [&](int tid, size_t begin, size_t end) {
+        auto& local = orders_partial[tid];
+        local.reserve((end - begin) / 8 + 1);
+        for (size_t i = begin; i < end; ++i) {
+            const auto& o = data.orders[i];
+            if (o.orderdate >= start_date && o.orderdate < end_date) {
+                auto it = customer_nation.find(o.cust_key);
+                if (it != customer_nation.end()) {
+                    local.emplace_back(o.key, o.cust_key);
+                }
             }
         }
+    };
+
+    {
+        size_t ochunk = (no + static_cast<size_t>(num_threads) - 1) / static_cast<size_t>(num_threads);
+        std::vector<std::thread> oworkers;
+        oworkers.reserve(num_threads);
+        for (int t = 0; t < num_threads; ++t) {
+            size_t b = std::min(static_cast<size_t>(t) * ochunk, no);
+            size_t e = std::min(b + ochunk, no);
+            if (b == e && t != 0) break;
+            oworkers.emplace_back(orders_worker, t, b, e);
+        }
+        for (auto& th : oworkers) th.join();
+    }
+
+    size_t total_orders = 0;
+    for (const auto& v : orders_partial) total_orders += v.size();
+
+    std::unordered_map<int32_t, int32_t> orders_cust;
+    orders_cust.reserve(total_orders + 1);
+    for (auto& v : orders_partial) {
+        for (const auto& p : v) orders_cust.emplace(p.first, p.second);
+        v.clear();
+        v.shrink_to_fit();
     }
 
     // 6. Parallel scan over lineitem. Each worker accumulates locally to

@@ -5,7 +5,8 @@ clone to a fully working multithreaded benchmark of TPC-H Query 5 at
 **Scale Factor 2 (SF2)**.
 
 The reference run on a Linux x86_64 box with `g++ 12.2.0` produced
-**5 ASIA nations**, single-thread query time ≈ **162 ms**, 4-thread ≈ **108 ms**.
+**5 ASIA nations**, single-thread query time ≈ **207 ms**, 4-thread ≈ **89 ms**
+(**2.33× speedup**).
 
 ---
 
@@ -172,19 +173,21 @@ diff results/result_t1.txt results/result_t4.txt && echo "results match"
 
 ## 5. Reference timings (SF2, Linux x86_64, g++ 12.2 -O3)
 
-Three runs averaged on a 96-core Xeon-class box:
+Median of 4 runs on a 96-core Xeon-class box:
 
 | Threads | Query exec time | Speedup vs 1T |
 |--------:|----------------:|--------------:|
-| 1       | ~162 ms         | 1.00×         |
-| 2       | ~128 ms         | 1.27×         |
-| 4       | ~108 ms         | 1.50×         |
-| 8       |  ~97 ms         | 1.67×         |
+| 1       | ~207 ms         | 1.00×         |
+| 2       | ~132 ms         | 1.57×         |
+| 4       |  ~89 ms         | 2.33×         |
+| 8       |  ~63 ms         | 3.29×         |
 
-> Why doesn't speedup scale linearly? Only the lineitem scan
-> (~12M rows) is parallelized. Building hash maps for region / nation /
-> supplier / customer / orders runs single-threaded, accounting for ~70 ms.
-> By Amdahl's law, that serial portion caps achievable speedup at ~2.3×.
+> Two stages are parallelized: the orders filter (3M rows) and the
+> lineitem scan (12M rows). The remaining serial work — region / nation /
+> supplier / customer filters plus the merge step — totals about 25–30 ms
+> and caps the theoretical speedup at ~7× even at infinite threads. We
+> hit ~85% of theoretical at both 4 and 8 threads. See `SOLUTION.md`
+> §5–§7 for the full Amdahl breakdown.
 
 Data-load time (`readTPCHData`) is reported separately and is dominated by
 parsing 1.5 GB of `lineitem.tbl` from disk — it sits around 3.2-3.5 s
